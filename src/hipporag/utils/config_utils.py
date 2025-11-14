@@ -149,6 +149,10 @@ class BaseConfig:
         default=2047,
         metadata={"help": "k for knn retrieval in buiding synonymy edges."}
     )
+    synonymy_out_edge_max_number: int = field(
+        default=100,
+        metadata={"help": "Max synonymy edges for each node."}
+    )
     synonymy_edge_query_batch_size: int = field(
         default=1000,
         metadata={"help": "Batch size for query embeddings for knn retrieval in buiding synonymy edges."}

@@ -162,6 +162,8 @@ class HippoRAG:
         self.all_retrieval_time = 0
 
         self.ent_node_to_chunk_ids = None
+        self._chunk_to_entity_node_keys: Dict[str, List[str]] = {}
+        self._new_entity_node_keys: Set[str] = set()
 
 
     def initialize_graph(self):
@@ -257,6 +259,7 @@ class HippoRAG:
         facts = flatten_facts(chunk_triples)
 
         logger.info(f"Encoding Entities")
+        new_entity_rows = self.entity_embedding_store.get_missing_string_hash_ids(entity_nodes)
         self.entity_embedding_store.insert_strings(entity_nodes)
 
         logger.info(f"Encoding Facts")
@@ -267,12 +270,23 @@ class HippoRAG:
         self.node_to_node_stats = {}
         self.ent_node_to_chunk_ids = {}
 
+        self._chunk_to_entity_node_keys = {
+            chunk_id: [
+                        self.entity_embedding_store.text_to_hash_id.get(ent) or
+                        self.entity_embedding_store.hash_text(ent)
+                        for ent in chunk_triple_entities[idx]
+                        ]
+            for idx, chunk_id in enumerate(chunk_ids)
+        }
+        self._new_entity_node_keys = set(new_entity_rows.keys())    # new entity nodes only
+
         self.add_fact_edges(chunk_ids, chunk_triples)
         num_new_chunks = self.add_passage_edges(chunk_ids, chunk_triple_entities)
 
         if num_new_chunks > 0:
             logger.info(f"Found {num_new_chunks} new chunks to save into graph.")
-            self.add_synonymy_edges()
+            self.synonymy_edges: dict[str, dict[str, float]] = {}       # new synonymy edges, key is the from node id, value is dict of to node id and score
+            self.add_synonymy_edges(chunk_keys_to_process)
 
             self.augment_graph()
             self.save_igraph()
@@ -760,8 +774,8 @@ class HippoRAG:
                 for triple in triples:
                     triple = tuple(triple)
 
-                    node_key = compute_mdhash_id(content=triple[0], prefix=("entity-"))
-                    node_2_key = compute_mdhash_id(content=triple[2], prefix=("entity-"))
+                    node_key = self.entity_embedding_store.hash_text(triple[0])
+                    node_2_key = self.entity_embedding_store.hash_text(triple[2])
 
                     self.node_to_node_stats[(node_key, node_2_key)] = self.node_to_node_stats.get(
                         (node_key, node_2_key), 0.0) + 1
@@ -810,7 +824,7 @@ class HippoRAG:
 
             if chunk_key not in current_graph_nodes:
                 for chunk_ent in chunk_triple_entities[idx]:
-                    node_key = compute_mdhash_id(chunk_ent, prefix="entity-")
+                    node_key = self.entity_embedding_store.hash_text(chunk_ent)
 
                     self.node_to_node_stats[(chunk_key, node_key)] = 1.0
 
@@ -818,68 +832,94 @@ class HippoRAG:
 
         return num_new_chunks
 
-    def add_synonymy_edges(self):
+    def add_synonymy_edges(self, new_chunk_ids: Optional[Set[str]] = None):
         """
-        Adds synonymy edges between similar nodes in the graph to enhance connectivity by identifying and linking synonym entities.
+        Adds synonymy edges between newly inserted phrase nodes and all existing phrase nodes.
 
-        This method performs key operations to compute and add synonymy edges. It first retrieves embeddings for all nodes, then conducts
-        a nearest neighbor (KNN) search to find similar nodes. These similar nodes are identified based on a score threshold, and edges
-        are added to represent the synonym relationship.
+        The method limits the expensive KNN lookup to only those phrase nodes introduced by the
+        latest batch of chunks, while still comparing them against the complete phrase store.
 
-        Attributes:
-            entity_id_to_row: dict (populated within the function). Maps each entity ID to its corresponding row data, where rows
-                              contain `content` of entities used for comparison.
-            entity_embedding_store: Manages retrieval of texts and embeddings for all rows related to entities.
-            global_config: Configuration object that defines parameters such as `synonymy_edge_topk`, `synonymy_edge_sim_threshold`,
-                           `synonymy_edge_query_batch_size`, and `synonymy_edge_key_batch_size`.
-            node_to_node_stats: dict. Stores scores for edges between nodes representing their relationship.
-
+        Args:
+            new_chunk_ids: Chunk identifiers that were newly processed during the current indexing
+                cycle. Synonym edges are generated only for new phrase nodes originating from these
+                chunks.
         """
-        logger.info(f"Expanding graph with synonymy edges")
+        if not new_chunk_ids:
+            logger.info("No new chunks provided for synonymy edge expansion; skipping.")
+            return
 
-        self.entity_id_to_row = self.entity_embedding_store.get_all_id_to_rows()
-        entity_node_keys = list(self.entity_id_to_row.keys())
+        if not self._chunk_to_entity_node_keys:
+            logger.info("Chunk-to-entity mapping unavailable; skipping synonymy edge expansion.")
+            return
 
-        logger.info(f"Performing KNN retrieval for each phrase nodes ({len(entity_node_keys)}).")
+        if not self._new_entity_node_keys:
+            logger.info("No newly added phrase nodes detected; skipping synonymy edge expansion.")
+            return
 
-        entity_embs = self.entity_embedding_store.get_embeddings(entity_node_keys)
+        new_chunk_ids = set(new_chunk_ids)
 
-        # Here we build synonymy edges only between newly inserted phrase nodes and all phrase nodes in the storage to reduce cost for incremental graph updates
-        query_node_key2knn_node_keys = retrieve_knn(query_ids=entity_node_keys,
-                                                    key_ids=entity_node_keys,
-                                                    query_vecs=entity_embs,
-                                                    key_vecs=entity_embs,
-                                                    k=self.global_config.synonymy_edge_topk,
-                                                    query_batch_size=self.global_config.synonymy_edge_query_batch_size,
-                                                    key_batch_size=self.global_config.synonymy_edge_key_batch_size)
+        new_query_node_keys = sorted({
+            node_key
+            for chunk_id in new_chunk_ids
+            for node_key in self._chunk_to_entity_node_keys.get(chunk_id, [])
+            if node_key in self._new_entity_node_keys
+        })
 
-        num_synonym_triple = 0
-        synonym_candidates = []  # [(node key, [(synonym node key, corresponding score), ...]), ...]
+        if not new_query_node_keys:
+            logger.info("New chunks did not introduce fresh phrase nodes; skipping synonymy edge expansion.")
+            return
 
-        for node_key in tqdm(query_node_key2knn_node_keys.keys(), total=len(query_node_key2knn_node_keys)):
-            synonyms = []
+        entity_id_to_row = self.entity_embedding_store.get_all_id_to_rows()
+        entity_node_keys = list(entity_id_to_row.keys())
+        total_phrase_nodes = len(entity_node_keys)
 
-            entity = self.entity_id_to_row[node_key]["content"]
+        logger.info(
+            f"Expanding graph with synonymy edges for {len(new_query_node_keys)} new phrase nodes against "
+            f"{total_phrase_nodes} total phrase nodes."
+        )
+
+        key_vecs = self.entity_embedding_store.get_embeddings(entity_node_keys)
+        query_vecs = self.entity_embedding_store.get_embeddings(new_query_node_keys)
+
+        query_node_key2knn_node_keys = retrieve_knn(
+            query_ids=new_query_node_keys,
+            key_ids=entity_node_keys,
+            query_vecs=query_vecs,
+            key_vecs=key_vecs,
+            k=self.global_config.synonymy_edge_topk,
+            query_batch_size=self.global_config.synonymy_edge_query_batch_size,
+            key_batch_size=self.global_config.synonymy_edge_key_batch_size,
+        )
+        max_edges = self.global_config.synonymy_out_edge_max_number
+        new_query_node_keys_set = set(new_query_node_keys)
+        old_node_edge_count = 0
+        synonymy_edge_count = 0
+
+        for node_key in tqdm(new_query_node_keys, total=len(new_query_node_keys)):
+
+            entity = entity_id_to_row.get(node_key, {}).get("content", "")
 
             if len(re.sub('[^A-Za-z0-9]', '', entity)) > 2:
-                nns = query_node_key2knn_node_keys[node_key]
-
+                nns = query_node_key2knn_node_keys.get(node_key, ([], []))
                 num_nns = 0
                 for nn, score in zip(nns[0], nns[1]):
-                    if score < self.global_config.synonymy_edge_sim_threshold or num_nns > 100:
+                    if score < self.global_config.synonymy_edge_sim_threshold or num_nns >= max_edges:
                         break
 
-                    nn_phrase = self.entity_id_to_row[nn]["content"]
+                    nn_phrase = entity_id_to_row.get(nn, {}).get("content", "")
 
                     if nn != node_key and nn_phrase != '':
                         sim_edge = (node_key, nn)
-                        synonyms.append((nn, score))
-                        num_synonym_triple += 1
-
-                        self.node_to_node_stats[sim_edge] = score  # Need to seriously discuss on this
-                        num_nns += 1
-
-            synonym_candidates.append((node_key, synonyms))
+                        if not self.node_to_node_stats.get(sim_edge):
+                            self.node_to_node_stats[sim_edge] = score
+                            num_nns += 1
+                            synonymy_edge_count += 1
+                        # add reverse edge as well if nn is not new node. If nn is new node, reverse edge will be added when processing nn
+                        reverse_edge = (nn, node_key)
+                        if nn not in new_query_node_keys_set and not self.node_to_node_stats.get(reverse_edge):
+                            self.node_to_node_stats[reverse_edge] = score
+                            old_node_edge_count += 1
+        logger.info(f"Added {synonymy_edge_count} synonymy edges between new phrase nodes, {old_node_edge_count} edges from existing phrase nodes.")
 
     def load_existing_openie(self, chunk_keys: List[str]) -> Tuple[List[dict], Set[str]]:
         """
@@ -1055,15 +1095,11 @@ class HippoRAG:
         managing adjacency lists, validating edges, and logging invalid edge cases.
         """
 
-        graph_adj_list = defaultdict(dict)
-        graph_inverse_adj_list = defaultdict(dict)
         edge_source_node_keys = []
         edge_target_node_keys = []
         edge_metadata = []
         for edge, weight in self.node_to_node_stats.items():
             if edge[0] == edge[1]: continue
-            graph_adj_list[edge[0]][edge[1]] = weight
-            graph_inverse_adj_list[edge[1]][edge[0]] = weight
 
             edge_source_node_keys.append(edge[0])
             edge_target_node_keys.append(edge[1])
@@ -1280,12 +1316,17 @@ class HippoRAG:
             for query, embedding in zip(all_query_strings, query_embeddings_for_triple):
                 self.query_to_embedding['triple'][query] = embedding
 
-            logger.info(f"Encoding {len(all_query_strings)} queries for query_to_passage.")
-            query_embeddings_for_passage = self.embedding_model.batch_encode(all_query_strings,
-                                                                             instruction=get_query_instruction('query_to_passage'),
-                                                                             norm=True)
-            for query, embedding in zip(all_query_strings, query_embeddings_for_passage):
+            # logger.info(f"Encoding {len(all_query_strings)} queries for query_to_passage.")
+            # query_embeddings_for_passage = self.embedding_model.batch_encode(all_query_strings,
+            #                                                                  instruction=get_query_instruction('query_to_passage'),
+            #                                                                  norm=True)
+            # for query, embedding in zip(all_query_strings, query_embeddings_for_passage):
+            #     self.query_to_embedding['passage'][query] = embedding
+
+            # Just use the same embeddings for both fact and passage retrieval for efficiency
+            for query, embedding in zip(all_query_strings, query_embeddings_for_triple):
                 self.query_to_embedding['passage'][query] = embedding
+                
 
     def get_fact_scores(self, query: str) -> np.ndarray:
         """
@@ -1393,7 +1434,7 @@ class HippoRAG:
         # only keep the top_k phrases in all_phrase_weights
         top_k_phrases = set(linking_score_map.keys())
         top_k_phrases_keys = set(
-            [compute_mdhash_id(content=top_k_phrase, prefix="entity-") for top_k_phrase in top_k_phrases])
+            [self.entity_embedding_store.hash_text(top_k_phrase) for top_k_phrase in top_k_phrases])
 
         for phrase_key in self.node_name_to_vertex_idx:
             if phrase_key not in top_k_phrases_keys:
@@ -1451,10 +1492,7 @@ class HippoRAG:
                 top_k_fact_indices[rank]] if query_fact_scores.ndim > 0 else query_fact_scores
 
             for phrase in [subject_phrase, object_phrase]:
-                phrase_key = compute_mdhash_id(
-                    content=phrase,
-                    prefix="entity-"
-                )
+                phrase_key = self.entity_embedding_store.hash_text(phrase)
                 phrase_id = self.node_name_to_vertex_idx.get(phrase_key, None)
 
                 if phrase_id is not None:

@@ -40,12 +40,15 @@ class EmbeddingStore:
             db_filename, f"vdb_{self.namespace}.parquet"
         )
         self._load_data()
+    
+    def hash_text(self, text: str) -> str:
+        return compute_mdhash_id(text, prefix=self.namespace + "-")
 
     def get_missing_string_hash_ids(self, texts: List[str]):
         nodes_dict = {}
 
         for text in texts:
-            nodes_dict[compute_mdhash_id(text, prefix=self.namespace + "-")] = {'content': text}
+            nodes_dict[self.hash_text(text)] = {'content': text}
 
         # Get all hash_ids from the input dictionary.
         all_hash_ids = list(nodes_dict.keys())
@@ -64,7 +67,7 @@ class EmbeddingStore:
         nodes_dict = {}
 
         for text in texts:
-            nodes_dict[compute_mdhash_id(text, prefix=self.namespace + "-")] = {'content': text}
+            nodes_dict[self.hash_text(text)] = {'content': text}
 
         # Get all hash_ids from the input dictionary.
         all_hash_ids = list(nodes_dict.keys())

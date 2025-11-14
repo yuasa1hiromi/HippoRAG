@@ -31,7 +31,7 @@ def main():
 
     print("Run indexing")
     hipporag.index(docs=docs)
-
+    exit()
     # Separate Retrieval & QA
     queries = [
         "What is George Rankin's occupation?",
